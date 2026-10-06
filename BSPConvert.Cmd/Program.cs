@@ -1,4 +1,5 @@
 using BSPConvert.Lib;
+using BSPConvert.Lib.GoldSrc;
 using CommandLine;
 using CommandLine.Text;
 
@@ -71,7 +72,7 @@ namespace BSPConvert.Cmd
 			[Option("animalpha", Required = false, Default = 1.0f, HelpText = "Translucency [0-1] for baked liquids. 1 (default) derives per-texel translucency from each texture's alpha/luminance; below 1 uses a flat constant alpha (lower = more see-through).")]
 			public float AnimAlpha { get; set; }
 
-			[Option("prefix", Required = false, Default = "df_", HelpText = "Prefix for the converted BSP's file name.")]
+			[Option("prefix", Required = false, HelpText = "Prefix for the converted BSP's file name.")]
 			public string Prefix { get; set; }
 
 			[Option("output", Required = false, HelpText = "Output game directory for converted BSP/materials.")]
@@ -83,7 +84,16 @@ namespace BSPConvert.Cmd
 			[Option("offmodeents", Required = false, Default = "cpm", HelpText = "For maps with different cpm/vq3 entities, choose which entities to use when played in non-defrag modes (e.g. --offmodeents vq3).")]
 			public string OffModeEntityFallback { get; set; }
 
-			[Value(0, MetaName = "input files", Required = true, HelpText = "Input Quake 3 BSP/PK3 file(s) to be converted.")]
+			[Option("wads", Required = false, Separator = ',', HelpText = "GoldSrc only: comma-separated folders to search (recursively) for the WAD files the map takes its textures from and its sky images (gfx/env), e.g. your Half-Life install or a folder of community WADs. The input's own folder and a default Steam Half-Life install are always searched.")]
+			public IEnumerable<string> WadDirs { get; set; }
+
+			[Option("studiomdl", Required = false, HelpText = "GoldSrc only: path to the studiomdl.exe that compiles the models entities use (in Momentum Mod's bin/win64 folder). Found next to the output game folder or in a default Steam Momentum Mod install if not given.")]
+			public string StudiomdlPath { get; set; }
+
+			[Option("goldsrchulls", Required = false, HelpText = "Copy the player clip hulls of this GoldSrc BSP into the input BSP(s) instead of converting them. For a Strata BSP recompiled from a converted map (e.g. decompiled, given new visuals and recompiled with VBSP), so GoldSrc-hull game modes collide exactly as in the GoldSrc map.")]
+			public string GoldSrcHullSource { get; set; }
+
+			[Value(0, MetaName = "input files", Required = true, HelpText = "Input Quake 3 BSP/PK3 or GoldSrc (Half-Life, CS 1.6) BSP/ZIP file(s) to be converted. Archives (.pk3/.zip) convert every BSP they contain. With --goldsrchulls, Strata BSP(s) to copy the clip hulls into.")]
 			public IEnumerable<string> InputFiles { get; set; }
 		}
 
@@ -127,34 +137,43 @@ namespace BSPConvert.Cmd
 				var converterOptions = new BSPConverterOptions()
 				{
 					noPak = options.NoPak,
-					noToolDisplacements = options.NoToolDisplacements,
-					patchesAsPrimitives = !options.PatchesAsDisplacements,
-					DisplacementPower = options.DisplacementPower,
 					minDamageToRespawnPlayer = options.MinDamageToRespawnPlayer,
-					lavaTriggers = options.LavaTriggers,
-					useObbFog = options.UseObbFog,
-					fogMinHeight = options.FogMinHeight,
-					noFogOverlay = options.NoFogOverlay,
 					ignoreZones = options.IgnoreZones,
-					noEnvMap = options.NoEnvMap,
 					//oldBSP = options.OldBSP,
 					compress = options.Compress,
 					prefix = options.Prefix,
 					inputFile = inputEntry,
 					outputDir = options.OutputDirectory,
 					mapFilter = options.Maps?.ToArray(),
-					offModeEntityFallback = options.OffModeEntityFallback,
-					clampOverbright = options.ClampOverbright,
 					scale = options.Scale,
-					flipbook = new FlipbookOptions()
+					goldSrcHullSource = options.GoldSrcHullSource,
+					goldSrc = new GoldSrcConverterOptions()
 					{
-						enabled = !options.NoAnim,
-						byteBudget = (long)(options.AnimBudgetMB * 1024 * 1024),
-						maxResolution = options.AnimMaxRes,
-						fps = options.AnimFps,
-						maxFrames = options.AnimMaxFrames,
-						alpha = options.AnimAlpha,
-						autoAlpha = options.AnimAlpha >= 1f
+						wadDirs = options.WadDirs?.ToArray(),
+						studiomdlPath = options.StudiomdlPath
+					},
+					q3 = new Q3ConverterOptions()
+					{
+						noToolDisplacements = options.NoToolDisplacements,
+						patchesAsPrimitives = !options.PatchesAsDisplacements,
+						DisplacementPower = options.DisplacementPower,
+						lavaTriggers = options.LavaTriggers,
+						useObbFog = options.UseObbFog,
+						fogMinHeight = options.FogMinHeight,
+						noFogOverlay = options.NoFogOverlay,
+						noEnvMap = options.NoEnvMap,
+						offModeEntityFallback = options.OffModeEntityFallback,
+						clampOverbright = options.ClampOverbright,
+						flipbook = new FlipbookOptions()
+						{
+							enabled = !options.NoAnim,
+							byteBudget = (long)(options.AnimBudgetMB * 1024 * 1024),
+							maxResolution = options.AnimMaxRes,
+							fps = options.AnimFps,
+							maxFrames = options.AnimMaxFrames,
+							alpha = options.AnimAlpha,
+							autoAlpha = options.AnimAlpha >= 1f
+						}
 					}
 				};
 				var converter = new BSPConverter(converterOptions, new ConsoleLogger());
