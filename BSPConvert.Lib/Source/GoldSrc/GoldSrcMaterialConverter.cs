@@ -37,13 +37,10 @@ namespace BSPConvert.Lib.GoldSrc
 		// GoldSrc advances animated textures at a fixed 10 frames per second
 		private const int AnimationFrameRate = 10;
 
-		// GoldSrc brightens the textures of BSPs, WADs and studio models as it loads them, apart from masked ones ('{'
-		// textures and masked model textures), to (c / 255)^(texgamma / gamma) with the default texgamma of 2 and gamma
-		// of 2.5 (BuildGammaTable, and Image_SetPalette's LUMP_TEXGAMMA in Xash). Its lightmaps go through a gamma table
-		// that's about the identity at the defaults, so they're converted without one.
-		private static readonly byte[] TexGammaTable = Enumerable.Range(0, 256)
-			.Select(i => (byte)Math.Clamp((int)(Math.Pow(i / 255.0, 2.0 / 2.5) * 255.0), 0, 255))
-			.ToArray();
+		// The texture gamma GoldSrc brightens textures with as it loads them, apart from masked ones ('{' textures and
+		// masked model textures), for the video settings the map is matched to (see GoldSrcBrightness). Its lightmaps have
+		// a gamma table of their own (see GoldSrcBrightness.LightmapToLinear).
+		private byte[] TexGammaTable => brightness.TexGammaTable;
 
 		// GoldSrc blends translucent surfaces in gamma space, where Strata, rendering in HDR, blends in linear space. That
 		// makes a dark translucent surface darken what's behind it much less, and a bright one brighten it more. So a
@@ -64,67 +61,96 @@ namespace BSPConvert.Lib.GoldSrc
 		// Larger textures are scaled down to this size per repeat, which keeps a baked warp's VTF to a few MB
 		private const int MaxWarpRepeatSize = 128;
 
-		private static readonly VTF.CreationOptions VtfOptions = new VTF.CreationOptions
-		{
-			Version = 6,
-			CompressionLevel = 0,
-			OutputFormat = ImageFormat.STRATA_BC7,
-			// GoldSrc textures are multiples of 16 but often not powers of two. Keep their size so they stay sharp;
-			// the VMT's mapping size keeps texture coordinates right whatever the VTF's size.
-			WidthResizeMethod = ImageConversion.ResizeMethod.NONE,
-			HeightResizeMethod = ImageConversion.ResizeMethod.NONE,
-			ComputeMips = 1,
-			ComputeThumbnail = 1,
-			ComputeReflectivity = 1,
-			ComputeTransparencyFlags = 1,
-		};
+		// Point sampled textures are drawn unfiltered and without mips, like GoldSrc's GL_NEAREST texture mode (its
+		// video options' texture filtering turned off), which it draws every texture with, sprites and skies included
+		private const VTF.Flags PointSampleFlags = VTF.Flags.V0_POINT_SAMPLE | VTF.Flags.V0_NO_MIP | VTF.Flags.V0_NO_LOD;
 
-		// Skybox faces are clamped so filtering doesn't wrap around to the opposite edge and leave seams, and drawn
-		// at about their full size, so like Valve's skyboxes they don't need mips
-		private static readonly VTF.CreationOptions SkyboxVtfOptions = new VTF.CreationOptions
-		{
-			Version = 6,
-			CompressionLevel = 0,
-			OutputFormat = ImageFormat.STRATA_BC7,
-			WidthResizeMethod = ImageConversion.ResizeMethod.POWER_OF_TWO_BIGGER,
-			HeightResizeMethod = ImageConversion.ResizeMethod.POWER_OF_TWO_BIGGER,
-			VTFFlags = VTF.Flags.V0_CLAMP_S | VTF.Flags.V0_CLAMP_T | VTF.Flags.V0_NO_MIP | VTF.Flags.V0_NO_LOD,
-			ComputeMips = 0,
-			ComputeThumbnail = 1,
-			ComputeReflectivity = 1,
-		};
-
-		// Model textures are mapped from 0 to 1 whatever their size, so they can be resized to the powers of two block
-		// compression needs
-		private static readonly VTF.CreationOptions ModelVtfOptions = new VTF.CreationOptions
-		{
-			Version = 6,
-			CompressionLevel = 0,
-			OutputFormat = ImageFormat.STRATA_BC7,
-			WidthResizeMethod = ImageConversion.ResizeMethod.POWER_OF_TWO_BIGGER,
-			HeightResizeMethod = ImageConversion.ResizeMethod.POWER_OF_TWO_BIGGER,
-			ComputeMips = 1,
-			ComputeThumbnail = 1,
-			ComputeReflectivity = 1,
-			ComputeTransparencyFlags = 1,
-		};
+		private readonly VTF.CreationOptions vtfOptions;
+		private readonly VTF.CreationOptions skyboxVtfOptions;
+		private readonly VTF.CreationOptions modelVtfOptions;
 
 		private readonly string contentDir;
+		private readonly bool pointSample;
+		private readonly GoldSrcBrightness brightness;
 		private readonly List<string> writtenFiles = new List<string>();
 
-		public GoldSrcMaterialConverter(string contentDir)
+		// brightness defaults to the game's own video settings
+		public GoldSrcMaterialConverter(string contentDir, GoldSrcBrightness? brightness = null, bool pointSample = false)
 		{
 			this.contentDir = contentDir;
+			this.brightness = brightness ?? new GoldSrcBrightness();
+			this.pointSample = pointSample;
+
+			vtfOptions = new VTF.CreationOptions
+			{
+				Version = 6,
+				CompressionLevel = 0,
+				OutputFormat = ImageFormat.STRATA_BC7,
+				// GoldSrc textures are multiples of 16 but often not powers of two. Keep their size so they stay sharp;
+				// the VMT's mapping size keeps texture coordinates right whatever the VTF's size.
+				WidthResizeMethod = ImageConversion.ResizeMethod.NONE,
+				HeightResizeMethod = ImageConversion.ResizeMethod.NONE,
+				VTFFlags = pointSample ? PointSampleFlags : 0,
+				ComputeMips = pointSample ? 0 : 1,
+				ComputeThumbnail = 1,
+				ComputeReflectivity = 1,
+				ComputeTransparencyFlags = 1,
+			};
+
+			// Skybox faces are clamped so filtering doesn't wrap around to the opposite edge and leave seams, and drawn
+			// at about their full size, so like Valve's skyboxes they don't need mips
+			skyboxVtfOptions = new VTF.CreationOptions
+			{
+				Version = 6,
+				CompressionLevel = 0,
+				OutputFormat = ImageFormat.STRATA_BC7,
+				WidthResizeMethod = ImageConversion.ResizeMethod.POWER_OF_TWO_BIGGER,
+				HeightResizeMethod = ImageConversion.ResizeMethod.POWER_OF_TWO_BIGGER,
+				VTFFlags = VTF.Flags.V0_CLAMP_S | VTF.Flags.V0_CLAMP_T | VTF.Flags.V0_NO_MIP | VTF.Flags.V0_NO_LOD |
+					(pointSample ? PointSampleFlags : 0),
+				ComputeMips = 0,
+				ComputeThumbnail = 1,
+				ComputeReflectivity = 1,
+			};
+
+			// Model textures are mapped from 0 to 1 whatever their size, so they can be resized to the powers of two block
+			// compression needs
+			modelVtfOptions = new VTF.CreationOptions
+			{
+				Version = 6,
+				CompressionLevel = 0,
+				OutputFormat = ImageFormat.STRATA_BC7,
+				WidthResizeMethod = ImageConversion.ResizeMethod.POWER_OF_TWO_BIGGER,
+				HeightResizeMethod = ImageConversion.ResizeMethod.POWER_OF_TWO_BIGGER,
+				VTFFlags = pointSample ? PointSampleFlags : 0,
+				ComputeMips = pointSample ? 0 : 1,
+				ComputeThumbnail = 1,
+				ComputeReflectivity = 1,
+				ComputeTransparencyFlags = 1,
+			};
 		}
 
 		// The VTFs and VMTs written so far
 		public IReadOnlyList<string> WrittenFiles => writtenFiles;
 
+		// Computes a VTF's mips, or flags it point sampled instead (see PointSampleFlags)
+		private void SetMips(VTF vtf)
+		{
+			if (pointSample)
+			{
+				vtf.AddFlags(PointSampleFlags);
+				return;
+			}
+
+			vtf.SetRecommendedMipCount();
+			vtf.ComputeMips();
+		}
+
 		public bool Convert(string materialName, MipTexture texture)
 		{
 			var isAlphaTested = IsAlphaTested(texture.Name);
 			var vtfPath = GetBasePath(materialName) + ".vtf";
-			if (!VTF.Create(DecodeRGBA(texture, isAlphaTested), ImageFormat.RGBA8888, (ushort)texture.Width, (ushort)texture.Height, vtfPath, VtfOptions))
+			if (!VTF.Create(DecodeRGBA(texture, isAlphaTested), ImageFormat.RGBA8888, (ushort)texture.Width, (ushort)texture.Height, vtfPath, vtfOptions))
 				return false;
 
 			writtenFiles.Add(vtfPath);
@@ -156,9 +182,9 @@ namespace BSPConvert.Lib.GoldSrc
 
 			using (var vtf = new VTF())
 			{
-				vtf.Version = VtfOptions.Version;
-				vtf.ImageWidthResizeMethod = VtfOptions.WidthResizeMethod;
-				vtf.ImageHeightResizeMethod = VtfOptions.HeightResizeMethod;
+				vtf.Version = vtfOptions.Version;
+				vtf.ImageWidthResizeMethod = vtfOptions.WidthResizeMethod;
+				vtf.ImageHeightResizeMethod = vtfOptions.HeightResizeMethod;
 				for (var frame = 0; frame < WarpFrames; frame++)
 				{
 					// The first frame sets the size the frames are allocated with
@@ -169,9 +195,8 @@ namespace BSPConvert.Lib.GoldSrc
 				}
 
 				vtf.ComputeReflectivity();
-				vtf.SetRecommendedMipCount();
-				vtf.ComputeMips();
-				vtf.SetFormat(VtfOptions.OutputFormat);
+				SetMips(vtf);
+				vtf.SetFormat(vtfOptions.OutputFormat);
 				vtf.ComputeTransparencyFlags();
 				if (!vtf.Bake(vtfPath))
 					return false;
@@ -281,9 +306,9 @@ namespace BSPConvert.Lib.GoldSrc
 
 			using (var vtf = new VTF())
 			{
-				vtf.Version = VtfOptions.Version;
-				vtf.ImageWidthResizeMethod = VtfOptions.WidthResizeMethod;
-				vtf.ImageHeightResizeMethod = VtfOptions.HeightResizeMethod;
+				vtf.Version = vtfOptions.Version;
+				vtf.ImageWidthResizeMethod = vtfOptions.WidthResizeMethod;
+				vtf.ImageHeightResizeMethod = vtfOptions.HeightResizeMethod;
 				var width = (ushort)first.Width;
 				var height = (ushort)first.Height;
 				if (!vtf.SetImage(DecodeRGBA(first, isAlphaTested), ImageFormat.RGBA8888, width, height) ||
@@ -297,9 +322,8 @@ namespace BSPConvert.Lib.GoldSrc
 				}
 
 				vtf.ComputeReflectivity();
-				vtf.SetRecommendedMipCount();
-				vtf.ComputeMips();
-				vtf.SetFormat(VtfOptions.OutputFormat);
+				SetMips(vtf);
+				vtf.SetFormat(vtfOptions.OutputFormat);
 				vtf.ComputeTransparencyFlags();
 				if (!vtf.Bake(vtfPath))
 					return false;
@@ -323,9 +347,9 @@ namespace BSPConvert.Lib.GoldSrc
 			var vtfPath = GetBasePath(vtfMaterialName) + ".vtf";
 			using (var vtf = new VTF())
 			{
-				vtf.Version = VtfOptions.Version;
-				vtf.ImageWidthResizeMethod = VtfOptions.WidthResizeMethod;
-				vtf.ImageHeightResizeMethod = VtfOptions.HeightResizeMethod;
+				vtf.Version = vtfOptions.Version;
+				vtf.ImageWidthResizeMethod = vtfOptions.WidthResizeMethod;
+				vtf.ImageHeightResizeMethod = vtfOptions.HeightResizeMethod;
 				var width = (ushort)texture.Width;
 				var height = (ushort)texture.Height;
 				if (!vtf.SetImage(DecodeRGBA(texture, isAlphaTested), ImageFormat.RGBA8888, width, height) ||
@@ -334,9 +358,8 @@ namespace BSPConvert.Lib.GoldSrc
 					return false;
 
 				vtf.ComputeReflectivity();
-				vtf.SetRecommendedMipCount();
-				vtf.ComputeMips();
-				vtf.SetFormat(VtfOptions.OutputFormat);
+				SetMips(vtf);
+				vtf.SetFormat(vtfOptions.OutputFormat);
 				vtf.ComputeTransparencyFlags();
 				if (!vtf.Bake(vtfPath))
 					return false;
@@ -353,9 +376,9 @@ namespace BSPConvert.Lib.GoldSrc
 			var basePath = GetBasePath(materialName);
 			using (var vtf = new VTF())
 			{
-				vtf.Version = VtfOptions.Version;
-				vtf.ImageWidthResizeMethod = VtfOptions.WidthResizeMethod;
-				vtf.ImageHeightResizeMethod = VtfOptions.HeightResizeMethod;
+				vtf.Version = vtfOptions.Version;
+				vtf.ImageWidthResizeMethod = vtfOptions.WidthResizeMethod;
+				vtf.ImageHeightResizeMethod = vtfOptions.HeightResizeMethod;
 				var width = (ushort)sprite.Width;
 				var height = (ushort)sprite.Height;
 				for (var i = 0; i < sprite.Frames.Count; i++)
@@ -374,9 +397,8 @@ namespace BSPConvert.Lib.GoldSrc
 				// Sprites are drawn once, so their edges shouldn't wrap around
 				vtf.AddFlags(VTF.Flags.V0_CLAMP_S | VTF.Flags.V0_CLAMP_T);
 				vtf.ComputeReflectivity();
-				vtf.SetRecommendedMipCount();
-				vtf.ComputeMips();
-				vtf.SetFormat(VtfOptions.OutputFormat);
+				SetMips(vtf);
+				vtf.SetFormat(vtfOptions.OutputFormat);
 				vtf.ComputeTransparencyFlags();
 				if (!vtf.Bake(basePath + ".vtf"))
 					return false;
@@ -430,7 +452,7 @@ namespace BSPConvert.Lib.GoldSrc
 				}
 			}
 
-			if (!VTF.Create(pixels, ImageFormat.RGBA8888, (ushort)texture.Width, (ushort)texture.Height, basePath + ".vtf", ModelVtfOptions))
+			if (!VTF.Create(pixels, ImageFormat.RGBA8888, (ushort)texture.Width, (ushort)texture.Height, basePath + ".vtf", modelVtfOptions))
 				return false;
 
 			writtenFiles.Add(basePath + ".vtf");
@@ -478,7 +500,7 @@ namespace BSPConvert.Lib.GoldSrc
 			}
 
 			var basePath = GetBasePath(materialName);
-			if (!VTF.Create(pixels, ImageFormat.RGBA8888, (ushort)texture.Width, (ushort)texture.Height, basePath + ".vtf", VtfOptions))
+			if (!VTF.Create(pixels, ImageFormat.RGBA8888, (ushort)texture.Width, (ushort)texture.Height, basePath + ".vtf", vtfOptions))
 				return false;
 
 			writtenFiles.Add(basePath + ".vtf");
@@ -502,7 +524,7 @@ namespace BSPConvert.Lib.GoldSrc
 		public bool ConvertSkyboxFace(string materialName, string imagePath)
 		{
 			var basePath = GetBasePath(materialName);
-			if (!VTF.Create(imagePath, basePath + ".vtf", SkyboxVtfOptions))
+			if (!VTF.Create(imagePath, basePath + ".vtf", skyboxVtfOptions))
 				return false;
 
 			writtenFiles.Add(basePath + ".vtf");
@@ -548,22 +570,24 @@ namespace BSPConvert.Lib.GoldSrc
 
 		// A material drawing an already converted texture (vtfMaterialName's VTF) the way a brush entity does: blended
 		// by its rendermode (amount is its renderamt as 0-1), scrolling at scrollSpeed, a func_conveyor's speed, and if
-		// toggled, drawing the frame of the VTF (see ConvertToggled) that the entity's texture frame index picks
+		// toggled, drawing the frame of the VTF (see ConvertToggled) that the entity's texture frame index picks. A lit
+		// translucent or additive one draws its lightmap, which GoldSrc doesn't, for faces whose map baked their
+		// lighting into their textures.
 		public void WriteVariant(string materialName, string vtfMaterialName, MipTexture texture, TextureAnimation animation, BlendMode blendMode,
-			float amount, float scrollSpeed, bool toggled)
+			float amount, float scrollSpeed, bool toggled, bool lit)
 		{
-			WriteVmt(materialName, vtfMaterialName, texture, IsAlphaTested(texture.Name), animation, blendMode, amount, scrollSpeed, toggled);
+			WriteVmt(materialName, vtfMaterialName, texture, IsAlphaTested(texture.Name), animation, blendMode, amount, scrollSpeed, toggled, lit);
 		}
 
 		private void WriteVmt(string materialName, string baseTexture, MipTexture texture, bool isAlphaTested, TextureAnimation animation,
-			BlendMode blendMode = BlendMode.Opaque, float amount = 1f, float scrollSpeed = 0f, bool toggled = false)
+			BlendMode blendMode = BlendMode.Opaque, float amount = 1f, float scrollSpeed = 0f, bool toggled = false, bool lit = false)
 		{
 			var vmtPath = GetBasePath(materialName) + ".vmt";
-			File.WriteAllText(vmtPath, CreateVmt(baseTexture, texture, isAlphaTested, animation, blendMode, amount, scrollSpeed, toggled));
+			File.WriteAllText(vmtPath, CreateVmt(baseTexture, texture, isAlphaTested, animation, blendMode, amount, scrollSpeed, toggled, lit));
 			writtenFiles.Add(vmtPath);
 		}
 
-		private static byte[] DecodeRGBA(MipTexture texture, bool isAlphaTested)
+		private byte[] DecodeRGBA(MipTexture texture, bool isAlphaTested)
 		{
 			var palette = texture.Palette;
 			var pixels = new byte[texture.Width * texture.Height * 4];
@@ -645,12 +669,12 @@ namespace BSPConvert.Lib.GoldSrc
 			while (newlyFilled.Count > 0);
 		}
 
-		private static string CreateVmt(string baseTexture, MipTexture texture, bool isAlphaTested, TextureAnimation animation, BlendMode blendMode,
-			float amount, float scrollSpeed, bool toggled)
+		private string CreateVmt(string baseTexture, MipTexture texture, bool isAlphaTested, TextureAnimation animation, BlendMode blendMode,
+			float amount, float scrollSpeed, bool toggled, bool lit)
 		{
 			// Water isn't lightmapped in GoldSrc, and neither are translucent or additive brush entities
 			var isTurbulent = IsTurbulent(texture.Name);
-			var isUnlit = isTurbulent || blendMode != BlendMode.Opaque;
+			var isUnlit = isTurbulent || (blendMode != BlendMode.Opaque && !lit);
 			var shader = isUnlit ? "UnlitGeneric" : "LightmappedGeneric";
 
 			var vmt = new StringBuilder();
@@ -744,7 +768,7 @@ namespace BSPConvert.Lib.GoldSrc
 
 		// The alpha that blends a texture in linear space over mid grey the way GoldSrc blends it by amount in gamma space
 		// (see BlendReferenceBackground)
-		private static float GetLinearBlendAlpha(MipTexture texture, bool isAlphaTested, float amount)
+		private float GetLinearBlendAlpha(MipTexture texture, bool isAlphaTested, float amount)
 		{
 			if (amount >= 1f)
 				return 1f;
@@ -763,7 +787,7 @@ namespace BSPConvert.Lib.GoldSrc
 		}
 
 		// The average brightness (0-1, gamma space) of a texture's visible texels as GoldSrc draws them
-		private static float GetAverageBrightness(MipTexture texture, bool isAlphaTested)
+		private float GetAverageBrightness(MipTexture texture, bool isAlphaTested)
 		{
 			var palette = texture.Palette;
 			double sum = 0;
