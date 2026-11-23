@@ -8,6 +8,7 @@ using System.Diagnostics;
 using System.Collections;
 using System.Xml.Linq;
 using BSPConvert.Lib.Source;
+using BSPConvert.Lib.Vis;
 
 using Plane = System.Numerics.Plane;
 using Vector3 = System.Numerics.Vector3;
@@ -55,6 +56,10 @@ namespace BSPConvert.Lib
 		// The Quake 3 mod (a folder of Q3Mods, e.g. missionpack for Team Arena) whose content maps use besides Quake 3's,
 		// or Q3Mods.BaseGame (baseq3) for Quake 3's alone. Null detects it from the textures the maps use, see Q3Mods.Detect.
 		public string? mod;
+		// How the visibility of maps compiled without it is computed, and the vvis.exe that does it (null finds
+		// Momentum Mod's, see MomentumTools.Find)
+		public VisMode vis = VisMode.Auto;
+		public string? vvisPath;
 	}
 
 	// Converts Quake 3 BSPs (see IEngineConverter). Shaders and external lightmaps are loaded once per input
@@ -106,6 +111,8 @@ namespace BSPConvert.Lib
 		// large external lightmap atlases (e.g. 2048x2048) can give a single large surface a luxel block bigger
 		// than this, so GetFaceLightmapBlock downscales such blocks to fit.
 		private const int MAX_LIGHTMAP_EXTENT = 1023;
+		// vbsp's MAXEDGES; the engine drops decals on faces over 48 verts
+		private const int MAX_FACE_EDGES = 32;
 		private const string invisibleDisplacementTexture = "tools/toolsinvisibledisplacement";
 
 		// Quake 3 base game content (pak0.pk3 extracted by the user), used for assets maps reference without bundling
@@ -198,11 +205,13 @@ namespace BSPConvert.Lib
 			progress.Stage("Converting light grid", shares.lightGrid);
 			ConvertLightGrid();
 
-			progress.Stage("Converting visibility", shares.visibility);
-			ConvertVisData();
 			builder.AddPlaceholderArea();
 			builder.AddPlaceholderAreaPortal();
 			builder.AddPlaceholderWorldLight();
+
+			// Last, since vvis reads the finished BSP
+			progress.Stage(GeneratesVisData ? "Computing visibility" : "Converting visibility", shares.visibility);
+			ConvertVisData();
 		}
 
 		private void ClearDictionaries()
@@ -496,6 +505,8 @@ namespace BSPConvert.Lib
 		private const float LightmapSeconds = 0.3f;
 		private const float LightGridSeconds = 1f;
 		private const float VisibilitySeconds = 0.05f;
+		// vvis on maps compiled without vis, unless --vis full makes it flow through a void the map is open to
+		private const float VvisSecondsPerLeaf = 0.0005f;
 
 		// Divides share of the map's progress between the stages after the materials, by how long they're estimated to
 		// take from how long the textures are estimated to take and the map's faces
@@ -503,10 +514,11 @@ namespace BSPConvert.Lib
 		{
 			var sounds = textures * SoundSecondsPerTextureSecond;
 			var geometry = GeometrySeconds + quakeBsp.Faces.Count * GeometrySecondsPerFace;
-			var total = textures + EntitySeconds + sounds + geometry + LightmapSeconds + LightGridSeconds + VisibilitySeconds;
+			var visibility = GeneratesVisData ? quakeBsp.Leaves.Count * VvisSecondsPerLeaf : VisibilitySeconds;
+			var total = textures + EntitySeconds + sounds + geometry + LightmapSeconds + LightGridSeconds + visibility;
 
 			float Share(float seconds) => share * seconds / total;
-			return (Share(textures), Share(EntitySeconds), Share(sounds), Share(geometry), Share(LightmapSeconds), Share(LightGridSeconds), Share(VisibilitySeconds));
+			return (Share(textures), Share(EntitySeconds), Share(sounds), Share(geometry), Share(LightmapSeconds), Share(LightGridSeconds), Share(visibility));
 		}
 
 		private void ConvertEntities()
@@ -1365,22 +1377,123 @@ namespace BSPConvert.Lib
 				return;
 			}
 
-			var sFace = builder.AddFace();
 			// TODO: Re-use brush planes?
-			sFace.PlaneIndex = CreatePlane(qFace); // Quake faces don't have planes, so create one
-			sFace.TextureInfoIndex = CreateTextureInfo(qFace, qFace.FirstIndexIndex);
-			sFace.DisplacementIndex = -1;
+			var planeIndex = CreatePlane(qFace); // Quake faces don't have planes, so create one
 
-			// Surface edges
-			(var surfEdgeIndex, var numEdges) = CreateSurfaceEdges(faceIndex);
-			sFace.FirstEdgeIndexIndex = surfEdgeIndex;
-			sFace.NumEdgeIndices = numEdges;
+			// Non-planar triangle soups have a zero normal, which passes every engine decal plane test
+			var hasPlane = qFace.Normal != Vector3.Zero;
+			var textureInfoIndex = CreateTextureInfo(qFace, qFace.FirstIndexIndex,
+				extraFlags: hasPlane ? 0 : (int)SourceSurfaceFlags.SURF_NODECALS);
 
-			// Primitives
-			sFace.FirstPrimitive = CreatePrimitive(qFace.Vertices.ToArray(), qFace.Indices.ToArray(), qFace);
-			sFace.NumPrimitives = 1;
+			var vertices = qFace.Vertices.ToArray();
+			var indices = qFace.Indices.ToArray();
+			var hullVerts = HullConverter.ConvertConvexHull(vertices, qFace.Normal);
 
-			splitFaceDict[faceIndex] = new int[] { sourceBsp.Faces.Count - 1 };
+			var pieces = new List<int[]> { Enumerable.Range(0, hullVerts.Count).ToArray() };
+			var pieceIndices = new[] { indices };
+			if (hasPlane && hullVerts.Count > MAX_FACE_EDGES)
+			{
+				var splitPieces = SplitConvexHull(hullVerts.Count);
+				var splitIndices = AssignTrianglesToPieces(vertices, indices, hullVerts, splitPieces, qFace.Normal);
+				if (splitIndices.All(x => x.Length > 0))
+				{
+					pieces = splitPieces;
+					pieceIndices = splitIndices;
+				}
+			}
+
+			splitFaceDict[faceIndex] = new int[pieces.Count];
+			for (var p = 0; p < pieces.Count; p++)
+			{
+				var sFace = builder.AddFace();
+				sFace.PlaneIndex = planeIndex;
+				sFace.TextureInfoIndex = textureInfoIndex;
+				sFace.DisplacementIndex = -1;
+
+				// Surface edges
+				var piece = pieces[p];
+				sFace.FirstEdgeIndexIndex = sourceBsp.FaceEdges.Count;
+				sFace.NumEdgeIndices = piece.Length;
+				for (var i = 0; i < piece.Length; i++)
+					builder.AddEdge(hullVerts[piece[(i + 1) % piece.Length]], hullVerts[piece[i]], faceIndex);
+
+				// Primitives
+				sFace.FirstPrimitive = CreatePrimitive(vertices, pieceIndices[p], qFace);
+				sFace.NumPrimitives = 1;
+
+				splitFaceDict[faceIndex][p] = sourceBsp.Faces.Count - 1;
+			}
+		}
+
+		// Splits a convex hull into convex pieces of at most MAX_FACE_EDGES verts, fanned from hull vert 0.
+		// Returns each piece's hull vert indices in hull order.
+		private static List<int[]> SplitConvexHull(int vertCount)
+		{
+			var numPieces = (vertCount - 2 + MAX_FACE_EDGES - 3) / (MAX_FACE_EDGES - 2);
+			var pieces = new List<int[]>();
+			var start = 1;
+			for (var p = 0; p < numPieces; p++)
+			{
+				var end = 1 + (int)Math.Round((p + 1) * (vertCount - 2) / (double)numPieces);
+				var piece = new int[end - start + 2];
+				for (var i = start; i <= end; i++)
+					piece[i - start + 1] = i;
+
+				pieces.Add(piece);
+				start = end;
+			}
+
+			return pieces;
+		}
+
+		// Gives each triangle to the piece holding its centroid. A triangle may overhang its piece; decals clip to the piece's edge loop.
+		private static int[][] AssignTrianglesToPieces(Vertex[] vertices, int[] indices, List<Vertex> hullVerts, List<int[]> pieces, Vector3 normal)
+		{
+			var pieceIndices = pieces.Select(_ => new List<int>()).ToArray();
+			for (var i = 0; i + 2 < indices.Length; i += 3)
+			{
+				var centroid = (vertices[indices[i]].position + vertices[indices[i + 1]].position + vertices[indices[i + 2]].position) / 3f;
+
+				var bestPiece = 0;
+				var bestDistance = float.MaxValue;
+				for (var p = 0; p < pieces.Count; p++)
+				{
+					var distance = GetDistanceOutsidePiece(centroid, hullVerts, pieces[p], normal);
+					if (distance < bestDistance)
+					{
+						bestDistance = distance;
+						bestPiece = p;
+					}
+				}
+
+				pieceIndices[bestPiece].AddRange(new[] { indices[i], indices[i + 1], indices[i + 2] });
+			}
+
+			return pieceIndices.Select(x => x.ToArray()).ToArray();
+		}
+
+		// How far a point lies outside a convex hull piece, in units (<= 0 when inside)
+		private static float GetDistanceOutsidePiece(Vector3 point, List<Vertex> hullVerts, int[] piece, Vector3 normal)
+		{
+			var origin = hullVerts[piece[0]].position;
+			var winding = 0f;
+			for (var i = 1; i + 1 < piece.Length; i++)
+				winding += Vector3.Dot(Vector3.Cross(hullVerts[piece[i]].position - origin, hullVerts[piece[i + 1]].position - origin), normal);
+
+			var sign = winding >= 0f ? 1f : -1f;
+			var distance = float.MinValue;
+			for (var i = 0; i < piece.Length; i++)
+			{
+				var a = hullVerts[piece[i]].position;
+				var edge = hullVerts[piece[(i + 1) % piece.Length]].position - a;
+				var length = edge.Length();
+				if (length < 0.001f)
+					continue;
+
+				distance = Math.Max(distance, -sign * Vector3.Dot(Vector3.Cross(edge, point - a), normal) / length);
+			}
+
+			return distance;
 		}
 
 		// Draws a fog brush face as the fog shader's visible overlay stages (e.g. the scrolling cloud layers on
@@ -2042,19 +2155,19 @@ namespace BSPConvert.Lib
 			return (surfEdgeIndex, numEdges);
 		}
 
-		private int CreateTextureInfo(Face qFace, int firstIndex, string nameOverride = null)
+		private int CreateTextureInfo(Face qFace, int firstIndex, string nameOverride = null, int extraFlags = 0)
 		{
 			(var uAxis, var vAxis) = GetTextureVectors(qFace, firstIndex);
-			return CreateTextureInfo(qFace.Texture, uAxis, vAxis, nameOverride);
+			return CreateTextureInfo(qFace.Texture, uAxis, vAxis, nameOverride, extraFlags);
 		}
 
 		// nameOverride points the texinfo (and its name->index lookup) at a different material than the source
 		// texture's name, keeping the source texture's surface flags. Used for fog overlay faces, whose geometry
 		// comes from a fog brush face but whose material is the sibling overlay (see TryCreateFogOverlayFace).
-		private int CreateTextureInfo(Texture texture, Vector3 uAxis, Vector3 vAxis, string nameOverride = null)
+		private int CreateTextureInfo(Texture texture, Vector3 uAxis, Vector3 vAxis, string nameOverride = null, int extraFlags = 0)
 		{
 			var textureName = nameOverride ?? texture.Name;
-			var flags = GetSourceSurfaceFlags(texture);
+			var flags = GetSourceSurfaceFlags(texture) | extraFlags;
 
 			// Tool-textured patches keep their surface flags after being rewritten onto the shared
 			// invisible displacement material, so they need its per-flag texdata variants too - see
@@ -2124,6 +2237,10 @@ namespace BSPConvert.Lib
 
 			if (q3Flags.HasFlag(Q3SurfaceFlags.SURF_NOIMPACT))
 				flags |= (int)SourceSurfaceFlags.SURF_NOIMPACT;
+
+			// Q3 leaves no marks on either
+			if ((q3Flags & (Q3SurfaceFlags.SURF_NOMARKS | Q3SurfaceFlags.SURF_NOIMPACT)) != 0)
+				flags |= (int)SourceSurfaceFlags.SURF_NODECALS;
 
 			return flags;
 		}
@@ -2407,11 +2524,13 @@ namespace BSPConvert.Lib
 			lightGridConverter.Convert();
 		}
 
+		private bool GeneratesVisData => quakeBsp.Visibility.Data.Length == 0 && options.q3.vis != VisMode.None;
+
 		private void ConvertVisData()
 		{
 			if (quakeBsp.Visibility.Data.Length == 0) // No VisData
 			{
-				sourceBsp.Visibility.Data = new byte[0];
+				sourceBsp.Visibility.Data = (GeneratesVisData ? GenerateVisData() : null) ?? new byte[0];
 				return;
 			}
 
@@ -2456,6 +2575,113 @@ namespace BSPConvert.Lib
 
 			sourceBsp.Visibility.Data = visData;
 		}
+
+		// Maps compiled without vis still number their leaves' clusters. The portals between them are rebuilt from the Q3
+		// tree, which the Source BSP has node for node and leaf for leaf.
+		private byte[]? GenerateVisData()
+		{
+			var vvis = MomentumTools.Find("vvis.exe", options.q3.vvisPath, options.outputDir);
+			if (vvis == null)
+			{
+				logger.Log("Warning: vvis.exe wasn't found, so the map, compiled without visibility, is drawn whole everywhere (pass the one in Momentum Mod's bin/win64 folder with --vvis)");
+				return null;
+			}
+
+			var leafClusters = quakeBsp.Leaves.Select(leaf => leaf.Visibility).ToList();
+			if (quakeBsp.Nodes.Count == 0 || leafClusters.DefaultIfEmpty(-1).Max() < 1)
+				return null;
+
+			var planes = quakeBsp.Planes.Select(plane => new TreePortals.TreePlane(ToVector3d(plane.Normal), plane.Distance)).ToList();
+			var nodes = quakeBsp.Nodes.Select(node => new TreePortals.TreeNode(node.PlaneIndex, node.Child1Index, node.Child2Index)).ToList();
+			var world = quakeBsp.Models[0];
+			var headNode = quakeBsp.Nodes[0];
+			var mins = ToVector3d(Vector3.Min(world.Minimums, headNode.Minimums));
+			var maxs = ToVector3d(Vector3.Max(world.Maximums, headNode.Maximums));
+
+			var clusterPortals = TreePortals.Build(planes, nodes, 0, leafClusters, mins, maxs);
+
+			// Filled like q3map2 fills the outside of maps that don't leak, since vvis takes hours to flow through it
+			var voidClusters = clusterPortals.FindVoid(GetEntityClusters(planes, nodes, leafClusters));
+			if (voidClusters.Count > 0)
+				logger.Log($"Filling the void around the map ({voidClusters.Count} clusters), which it leaks into");
+
+			// The engine counts the clusters up to the highest a leaf has, which the visibility's count must match
+			var newClusters = new int[clusterPortals.NumClusters];
+			var numClusters = 0;
+			for (var cluster = 0; cluster < newClusters.Length; cluster++)
+				newClusters[cluster] = voidClusters.Contains(cluster) ? -1 : numClusters++;
+			var portals = clusterPortals.Portals
+				.Where(portal => newClusters[portal.FrontCluster] >= 0)
+				.Select(portal => portal with { FrontCluster = newClusters[portal.FrontCluster], BackCluster = newClusters[portal.BackCluster] })
+				.ToList();
+
+			logger.Log($"Computing visibility from {portals.Count} portals between {numClusters} clusters");
+			VvisResult? result;
+			using (var compiler = new VvisCompiler(vvis, logger, progress, builder, quakeBsp.MapName, numClusters, portals))
+				result = RunVvis(compiler, numClusters);
+			if (result == null)
+				return null;
+
+			for (var i = 0; i < sourceBsp.Leaves.Count; i++)
+			{
+				var leaf = sourceBsp.Leaves[i];
+				if (leaf.Visibility >= 0 && leaf.Visibility < newClusters.Length)
+					leaf.Visibility = newClusters[leaf.Visibility];
+			}
+
+			return result.Value.VisData;
+		}
+
+		// Total clusters seen in the fast visibility above which the full one takes hours (2.4 million took vvis 5 seconds,
+		// 32 million over 10 minutes)
+		private const long MaxFullVisClusters = 10_000_000;
+		private static readonly TimeSpan FullVisTimeLimit = TimeSpan.FromMinutes(5);
+
+		private VvisResult? RunVvis(VvisCompiler compiler, int numClusters)
+		{
+			switch (options.q3.vis)
+			{
+				case VisMode.Full:
+					return compiler.Run(fast: false, timeLimit: null, 0, 20);
+				case VisMode.Fast:
+					return compiler.Run(fast: true, timeLimit: null, 0, 10);
+			}
+
+			var fastResult = compiler.Run(fast: true, timeLimit: null, 0, 30);
+			if (fastResult == null)
+				return null;
+
+			if (fastResult.Value.VisibleClusters > MaxFullVisClusters)
+			{
+				logger.Log($"Using the fast visibility, which draws more: its clusters could see {fastResult.Value.VisibleClusters / numClusters} of the {numClusters} each, too many to compute the full visibility in reasonable time (--vis full does anyway)");
+				return fastResult;
+			}
+
+			var fullResult = compiler.Run(fast: false, FullVisTimeLimit, 10, 30);
+			if (fullResult == null)
+				logger.Log($"Using the fast visibility, which draws more: the full visibility took over {FullVisTimeLimit.TotalMinutes} minutes (--vis full waits for it)");
+
+			return fullResult ?? fastResult;
+		}
+
+		// The clusters entities' origins are in. Brush entities without one, like triggers, often stick out into the void.
+		private HashSet<int> GetEntityClusters(List<TreePortals.TreePlane> planes, List<TreePortals.TreeNode> nodes, List<int> leafClusters)
+		{
+			var result = new HashSet<int>();
+			foreach (var entity in quakeBsp.Entities)
+			{
+				if (entity.ClassName == "worldspawn" || !entity.ContainsKey("origin"))
+					continue;
+
+				var cluster = leafClusters[TreePortals.FindLeaf(planes, nodes, 0, ToVector3d(entity.Origin))];
+				if (cluster >= 0)
+					result.Add(cluster);
+			}
+
+			return result;
+		}
+
+		private static Vector3d ToVector3d(Vector3 vector) => new Vector3d(vector.X, vector.Y, vector.Z);
 
 	}
 }
